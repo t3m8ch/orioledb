@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable, Iterator
+from difflib import SequenceMatcher
 from typing import Any, Literal, NamedTuple
 
 from testgres.connection import NodeConnection, pglib
@@ -35,11 +36,11 @@ S1End = Literal['COMMIT', 'ROLLBACK']
 # (k, u, v): a row of table t.
 Row = tuple[int, int, str]
 
-# (statement, result) for every statement of both sessions, in order.  A
-# result is the rows returned (RETURNING k, SELECT), the command tag if there
-# are none ('ROLLBACK' for a COMMIT of a failed transaction), or
+# (statement, SQL, result) for every statement of both sessions, in order.
+# A result is the rows returned (RETURNING k, SELECT), the command tag if
+# there are none ('ROLLBACK' for a COMMIT of a failed transaction), or
 # 'ERROR <SQLSTATE>'.
-Results = list[tuple[str, str]]
+Results = list[tuple[str, str, str]]
 
 ACCESS_METHODS: tuple[AccessMethod, ...] = ('heap', 'orioledb')
 LEVELS: dict[Level, str] = {'RC': 'READ COMMITTED', 'RR': 'REPEATABLE READ'}
@@ -99,7 +100,6 @@ class Outcome(NamedTuple):
 
 
 class UniqueConflictTest(BaseTest):
-	maxDiff = None  # show whole result diffs
 	ctl: NodeConnection
 
 	def setUp(self):
@@ -146,7 +146,7 @@ class UniqueConflictTest(BaseTest):
 						write.start()
 						blocked = self._wait_blocked(s2_pid, s1_pid, write)
 						step(results, 's1_end', s1, case.s1_end)
-						join_step(results, 's2_write', s2, write)
+						join_step(results, 's2_write', s2, s2_sql, write)
 					step(results, 's2_read', s2, read_sql(c))
 					step(results, 's2_commit', s2, 'COMMIT')
 					s1.close()
@@ -193,7 +193,7 @@ class UniqueConflictTest(BaseTest):
 						write.start()
 						blocked = self._wait_blocked(s2_pid, s1_pid, write)
 						step(results, 's1_end', s1, case.s1_end)
-						join_step(results, 's2_write', s2, write)
+						join_step(results, 's2_write', s2, s2_sql, write)
 					step(results, 's2_read', s2, read_sql(c))
 					step(results, 's2_commit', s2, 'COMMIT')
 					s1.close()
@@ -242,7 +242,7 @@ class UniqueConflictTest(BaseTest):
 						write.start()
 						blocked = self._wait_blocked(s2_pid, s1_pid, write)
 						step(results, 's1_end', s1, case.s1_end)
-						join_step(results, 's2_write', s2, write)
+						join_step(results, 's2_write', s2, s2_sql, write)
 					step(results, 's2_read', s2, read_sql(c))
 					step(results, 's2_commit', s2, 'COMMIT')
 					s1.close()
@@ -291,7 +291,7 @@ class UniqueConflictTest(BaseTest):
 						write.start()
 						blocked = self._wait_blocked(s2_pid, s1_pid, write)
 						step(results, 's1_end', s1, case.s1_end)
-						join_step(results, 's2_write', s2, write)
+						join_step(results, 's2_write', s2, s2_sql, write)
 					step(results, 's2_read', s2, read_sql(c))
 					step(results, 's2_commit', s2, 'COMMIT')
 					s1.close()
@@ -352,7 +352,7 @@ class UniqueConflictTest(BaseTest):
 							    s2_pid, s1_pid, insert)
 							step(results, 's1_end', s1, case.s1_end)
 							inserted = join_step(results, 's2_insert', s2,
-							                     insert)
+							                     s2_insert, insert)
 						if inserted.startswith('ERROR'):
 							step(results, 's2_rollback_to', s2,
 							     'ROLLBACK TO SAVEPOINT upsert')
@@ -393,14 +393,14 @@ class UniqueConflictTest(BaseTest):
 	                        expected: dict[str, str]) -> None:
 		"""The scenario does what it is meant to: heap behaves as PG says."""
 		self.assertEqual(heap.blocked, case.concurrent, 'heap: blocked')
-		results = dict(heap.results)
+		results = {label: result for label, _, result in heap.results}
 		for label, want in expected.items():
 			self.assertEqual(results.get(label), want, f'heap: {label}')
 
 	def assertSameAsHeap(self, heap: Outcome, oriole: Outcome) -> None:
-		self.assertEqual(heap.blocked, oriole.blocked, 'blocked')
-		self.assertListEqual(heap.results, oriole.results)
-		self.assertListEqual(heap.rows, oriole.rows)
+		if oriole != heap:
+			self.fail('heap and orioledb differ\n' +
+			          side_by_side(heap, oriole))
 
 	def _create_table(self, am: AccessMethod) -> None:
 		self.ctl.execute('DROP TABLE IF EXISTS t')
@@ -491,16 +491,16 @@ def returning(*keys: int) -> str:
 
 def step(results: Results, label: str, con: NodeConnection, sql: str) -> str:
 	"""Executes sql and records its result under label."""
-	return record(results, label, con, lambda: con.execute(sql))
+	return record(results, label, sql, con, lambda: con.execute(sql))
 
 
-def join_step(results: Results, label: str, con: NodeConnection,
+def join_step(results: Results, label: str, con: NodeConnection, sql: str,
               thread: ThreadQueryExecutor) -> str:
-	"""Waits for the statement running in thread and records its result."""
-	return record(results, label, con, thread.join)
+	"""Waits for sql, running in thread, and records its result."""
+	return record(results, label, sql, con, thread.join)
 
 
-def record(results: Results, label: str, con: NodeConnection,
+def record(results: Results, label: str, sql: str, con: NodeConnection,
            execute: Callable[[], Any]) -> str:
 	try:
 		rows = execute()
@@ -513,8 +513,52 @@ def record(results: Results, label: str, con: NodeConnection,
 			result = str(getattr(con.cursor, 'statusmessage', 'ok'))
 		else:
 			result = str(rows)
-	results.append((label, result))
+	results.append((label, sql, result))
 	return result
+
+
+def side_by_side(heap: Outcome, oriole: Outcome) -> str:
+	"""
+	Both runs as a table, one line per statement, '!' marking the lines that
+	differ, followed by whether s2 blocked and the final rows.
+	"""
+	heap_steps = {label: (sql, res) for label, sql, res in heap.results}
+	oriole_steps = {label: (sql, res) for label, sql, res in oriole.results}
+
+	# The runs may take different branches (the upsert does), so merge the two
+	# label sequences, keeping each in its own order.
+	a = [label for label, _, _ in heap.results]
+	b = [label for label, _, _ in oriole.results]
+	labels: list[str] = []
+	for tag, i1, i2, j1, j2 in SequenceMatcher(None, a, b).get_opcodes():
+		for label in a[i1:i2] + (b[j1:j2] if tag != 'equal' else []):
+			if label not in labels:
+				labels.append(label)
+
+	table = [(' ', 'step', 'SQL', 'heap', 'orioledb')]
+	for label in labels:
+		heap_sql, heap_res = heap_steps.get(label, ('', '-'))
+		oriole_sql, oriole_res = oriole_steps.get(label, ('', '-'))
+		mark = ' ' if (heap_sql, heap_res) == (oriole_sql, oriole_res) else '!'
+		table.append((mark, label, heap_sql
+		              or oriole_sql, heap_res, oriole_res))
+	widths = [max(len(cell) for cell in column) for column in zip(*table)]
+	lines = [
+	    '  '.join(cell.ljust(width)
+	              for cell, width in zip(row, widths)).rstrip()
+	    for row in table
+	]
+
+	for name, heap_value, oriole_value in [
+	    ('blocked', heap.blocked, oriole.blocked),
+	    ('final rows', heap.rows, oriole.rows),
+	]:
+		if heap_value == oriole_value:
+			lines.append(f'  {name}: {heap_value}')
+		else:
+			lines.append(
+			    f'! {name}: heap {heap_value}, orioledb {oriole_value}')
+	return '\n'.join(lines)
 
 
 def query(con: NodeConnection, sql: str) -> list[Any]:
