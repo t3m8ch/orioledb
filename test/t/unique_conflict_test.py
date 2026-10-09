@@ -21,6 +21,7 @@ from collections.abc import Callable, Iterator
 from difflib import SequenceMatcher
 from typing import Any, Literal, NamedTuple
 
+from psycopg2 import errorcodes
 from testgres.connection import NodeConnection, pglib
 
 from .base_test import BaseTest, ThreadQueryExecutor
@@ -39,8 +40,11 @@ Row = tuple[int, int, str]
 # (statement, SQL, result) for every statement of both sessions, in order.
 # A result is the rows returned (RETURNING k, SELECT), the command tag if
 # there are none ('ROLLBACK' for a COMMIT of a failed transaction), or
-# 'ERROR <SQLSTATE>'.
+# 'ERROR <SQLSTATE> <condition name>'.
 Results = list[tuple[str, str, str]]
+
+UNIQUE_VIOLATION = 'ERROR 23505 unique_violation'
+SERIALIZATION_FAILURE = 'ERROR 40001 serialization_failure'
 
 ACCESS_METHODS: tuple[AccessMethod, ...] = ('heap', 'orioledb')
 LEVELS: dict[Level, str] = {'RC': 'READ COMMITTED', 'RR': 'REPEATABLE READ'}
@@ -156,7 +160,7 @@ class UniqueConflictTest(BaseTest):
 
 				heap = outcomes['heap']
 				if case.s1_end == 'COMMIT':
-					want = 'ERROR 23505'
+					want = UNIQUE_VIOLATION
 				else:
 					want = returning(c.s2_row[0])
 				self.assertHeapFollowsPg(heap, case, {'s2_write': want})
@@ -203,7 +207,7 @@ class UniqueConflictTest(BaseTest):
 
 				heap = outcomes['heap']
 				if case.s1_row_hidden:
-					want = 'ERROR 40001'
+					want = SERIALIZATION_FAILURE
 				elif case.s1_end == 'COMMIT':
 					want = returning()
 				else:
@@ -252,7 +256,7 @@ class UniqueConflictTest(BaseTest):
 
 				heap = outcomes['heap']
 				if case.s1_row_hidden:
-					want = 'ERROR 40001'
+					want = SERIALIZATION_FAILURE
 				elif case.s1_end == 'COMMIT':
 					want = returning(c.s1_row[0])
 				else:
@@ -301,7 +305,7 @@ class UniqueConflictTest(BaseTest):
 
 				heap = outcomes['heap']
 				if case.s1_row_hidden:
-					want = 'ERROR 40001'
+					want = SERIALIZATION_FAILURE
 				elif case.s1_end == 'COMMIT':
 					want = returning(c.s1_row[0])
 				else:
@@ -378,7 +382,7 @@ class UniqueConflictTest(BaseTest):
 					    c.s1_row[0]) if case.level == 'RC' else returning()
 					want = {
 					    's2_update': returning(),
-					    's2_insert': 'ERROR 23505',
+					    's2_insert': UNIQUE_VIOLATION,
 					    's2_update_again': again,
 					}
 				else:
@@ -505,7 +509,7 @@ def record(results: Results, label: str, sql: str, con: NodeConnection,
 	try:
 		rows = execute()
 	except pglib.Error as e:
-		result = f"ERROR {getattr(e, 'pgcode', None)}"
+		result = error_result(getattr(e, 'pgcode', None))
 	else:
 		if rows is None:
 			# psycopg2's command tag: 'BEGIN', 'ROLLBACK' for a failed
@@ -559,6 +563,17 @@ def side_by_side(heap: Outcome, oriole: Outcome) -> str:
 			lines.append(
 			    f'! {name}: heap {heap_value}, orioledb {oriole_value}')
 	return '\n'.join(lines)
+
+
+def error_result(code: str | None) -> str:
+	"""'ERROR <SQLSTATE> <condition name>', named as in PostgreSQL's docs."""
+	if code is None:  # not from the server, e.g. a broken connection
+		return 'ERROR without SQLSTATE'
+	try:
+		name = errorcodes.lookup(code).lower()
+	except KeyError:
+		name = 'unknown'
+	return f'ERROR {code} {name}'
 
 
 def query(con: NodeConnection, sql: str) -> list[Any]:
